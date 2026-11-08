@@ -2011,25 +2011,64 @@ namespace Gpu {
 
 		static string lookup_xe_device_name(uint32_t dev_id) {
 			switch (dev_id) {
-				case 0xe202:
+				// Panther Lake (Xe3)
+				case 0xb080:
+				case 0xb082: return "Intel Arc B390";
+				case 0xb081:
+				case 0xb083: return "Intel Arc B370";
+				case 0xb084:
+				case 0xb086: return "Intel Arc Pro B390";
+				case 0xb085:
+				case 0xb087: return "Intel Arc Pro B370";
+				case 0xb08f:
+				case 0xb090:
+				case 0xb0a0:
+				case 0xb0b0: return "Intel Panther Lake Graphics";
+
+				// Battlemage (Xe2)
+				case 0xe202: return "Intel Arc Graphics (BMG)";
 				case 0xe20b: return "Intel Arc B580";
 				case 0xe20c: return "Intel Arc B570";
-				case 0xe20d: return "Intel Arc Battlemage";
+				case 0xe20d:
+				case 0xe210:
+				case 0xe215:
+				case 0xe216: return "Intel Arc Battlemage";
 				case 0xe211: return "Intel Arc Pro B60";
 				case 0xe212: return "Intel Arc Pro B50";
+				case 0xe220:
+				case 0xe221: return "Intel Arc Battlemage G31";
+				case 0xe222: return "Intel Arc Pro B65";
+				case 0xe223: return "Intel Arc Pro B70";
+
+				// Alchemist (Xe-HPG)
+				case 0x5690:
 				case 0x56a0: return "Intel Arc A770";
+				case 0x5691:
 				case 0x56a1: return "Intel Arc A750";
+				case 0x5692:
 				case 0x56a2: return "Intel Arc A580";
+				case 0x5693:
 				case 0x56a5: return "Intel Arc A380";
+				case 0x5694:
 				case 0x56a6: return "Intel Arc A310";
-				case 0x64a0: return "Intel Arc Graphics";
+				case 0x5695: return "Intel Arc A370M";
+				case 0x56b0: return "Intel Arc Pro A30M";
+				case 0x56b1: return "Intel Arc Pro A40/A50";
+				case 0x56b2: return "Intel Arc Pro A60M";
+				case 0x56b3: return "Intel Arc Pro A60";
+
+				// Lunar Lake (Xe2-LPG)
+				case 0x6420:
+				case 0x64b0: return "Intel Lunar Lake Graphics";
+				case 0x64a0: return "Intel Arc Graphics 140V";
+
 				default: break;
 			}
 			string hex_id = fmt::format("{:04x}", dev_id);
 			if (char* db_name = get_intel_device_name(hex_id.c_str()); db_name != nullptr) {
 				string res(db_name);
 				free(db_name);
-				return res;
+				if (not res.contains("(unknown)")) return res;
 			}
 			return fmt::format("Intel Xe GPU (8086:{:04x})", dev_id);
 		}
