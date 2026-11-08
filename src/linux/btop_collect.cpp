@@ -33,10 +33,14 @@ tab-size = 4
 #include <utility>
 
 #include <arpa/inet.h> // for inet_ntop()
+#include <cstring>
+#include <dirent.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
@@ -1908,8 +1912,480 @@ namespace Gpu {
 	}
 
 	namespace Intel {
+		//? Intel Xe kernel driver structures and helpers (Linux 6.8+)
+		struct xe_device_query_abi {
+			uint64_t extensions;
+			uint32_t query;
+			uint32_t size;
+			uint64_t data;
+			uint64_t reserved[2];
+		};
+
+		struct xe_mem_region_abi {
+			uint16_t mem_class;
+			uint16_t instance;
+			uint32_t min_page_size;
+			uint64_t total_size;
+			uint64_t used;
+			uint64_t cpu_visible_size;
+			uint64_t cpu_visible_used;
+			uint64_t reserved[6];
+		};
+
+		struct xe_query_mem_regions_abi {
+			uint32_t num_mem_regions;
+			uint32_t pad;
+		};
+
+		static constexpr unsigned long XE_IOCTL_DEVICE_QUERY = _IOWR('d', 0x40, xe_device_query_abi);
+		static constexpr uint32_t XE_QUERY_MEM_REGIONS = 1;
+		static constexpr uint16_t XE_MEM_REGION_CLASS_VRAM = 1;
+
+		struct xe_client_sample {
+			std::array<uint64_t, 5> cycles{};
+			std::array<uint64_t, 5> total_cycles{};
+			std::array<uint64_t, 5> capacity{1, 1, 1, 1, 1};
+			uint64_t vram_bytes = 0;
+		};
+
+		struct xe_device {
+			fs::path device;
+			fs::path hwmon;
+			fs::path freq_path;
+			fs::path temp_path;
+			fs::path power_path;
+			fs::path energy_path;
+			fs::path gt_idle_path;
+			string pci_slot;
+			string name;
+			uint32_t pci_device_id = 0;
+			int drm_fd = -1;
+			bool freq_is_hz = false;
+			bool has_vram = false;
+			bool has_temp = false;
+			bool has_freq = false;
+			bool has_power = false;
+			long long temp_max = 100;
+			long long pwr_max = 190'000;
+			long long prev_energy_uj = 0;
+			long long prev_energy_ts_us = 0;
+			long long prev_idle_ms = 0;
+			long long prev_idle_ts_us = 0;
+			uint64_t vram_total = 0;
+			std::unordered_map<uint64_t, xe_client_sample> prev_clients;
+		};
+
+		static vector<xe_device> xe_devices;
+		static bool use_xe = false;
+
+		static long long read_ll(const fs::path& path, long long fallback = 0) {
+			try {
+				return std::stoll(readfile(path, std::to_string(fallback)));
+			} catch (const std::exception&) {
+				return fallback;
+			}
+		}
+
+		static string trim_sysfs(string s) {
+			while (not s.empty() and (s.back() == '\n' or s.back() == '\r' or s.back() == ' ' or s.back() == '\t')) {
+				s.pop_back();
+			}
+			return s;
+		}
+
+		static bool is_card_node(const string& fname) {
+			if (not fname.starts_with("card") or fname.size() <= 4) return false;
+			return std::ranges::all_of(fname.begin() + 4, fname.end(),
+				[](char c) { return c >= '0' and c <= '9'; });
+		}
+
+		static fs::path find_hwmon(const fs::path& device) {
+			const auto hwmon_dir = device / "hwmon";
+			std::error_code ec;
+			if (not fs::is_directory(hwmon_dir, ec)) return {};
+			for (const auto& h : fs::directory_iterator(hwmon_dir, ec)) {
+				if (h.is_directory()) return h.path();
+			}
+			return {};
+		}
+
+		static string lookup_xe_device_name(uint32_t dev_id) {
+			switch (dev_id) {
+				case 0xe202:
+				case 0xe20b: return "Intel Arc B580";
+				case 0xe20c: return "Intel Arc B570";
+				case 0xe20d: return "Intel Arc Battlemage";
+				case 0xe211: return "Intel Arc Pro B60";
+				case 0xe212: return "Intel Arc Pro B50";
+				case 0x56a0: return "Intel Arc A770";
+				case 0x56a1: return "Intel Arc A750";
+				case 0x56a2: return "Intel Arc A580";
+				case 0x56a5: return "Intel Arc A380";
+				case 0x56a6: return "Intel Arc A310";
+				case 0x64a0: return "Intel Arc Graphics";
+				default: break;
+			}
+			string hex_id = fmt::format("{:04x}", dev_id);
+			if (char* db_name = get_intel_device_name(hex_id.c_str()); db_name != nullptr) {
+				string res(db_name);
+				free(db_name);
+				return res;
+			}
+			return fmt::format("Intel Xe GPU (8086:{:04x})", dev_id);
+		}
+
+		static bool query_xe_vram(int drm_fd, uint64_t& out_total, uint64_t& out_used) {
+			if (drm_fd < 0) return false;
+			xe_device_query_abi q{};
+			q.query = XE_QUERY_MEM_REGIONS;
+			if (ioctl(drm_fd, XE_IOCTL_DEVICE_QUERY, &q) != 0 or q.size < sizeof(xe_query_mem_regions_abi) or q.size > 4096) {
+				return false;
+			}
+			vector<uint8_t> buf(q.size, 0);
+			q.data = reinterpret_cast<uintptr_t>(buf.data());
+			if (ioctl(drm_fd, XE_IOCTL_DEVICE_QUERY, &q) != 0) {
+				return false;
+			}
+			const auto* hdr = reinterpret_cast<const xe_query_mem_regions_abi*>(buf.data());
+			const auto* regions = reinterpret_cast<const xe_mem_region_abi*>(buf.data() + sizeof(xe_query_mem_regions_abi));
+			uint64_t total = 0;
+			uint64_t used = 0;
+			for (uint32_t i = 0; i < hdr->num_mem_regions; ++i) {
+				if (sizeof(xe_query_mem_regions_abi) + (i + 1) * sizeof(xe_mem_region_abi) > buf.size()) break;
+				if (regions[i].mem_class == XE_MEM_REGION_CLASS_VRAM) {
+					total += regions[i].total_size;
+					used += regions[i].used;
+				}
+			}
+			out_total = total;
+			out_used = used;
+			return total > 0;
+		}
+
+		static int engine_index(std::string_view name) {
+			if (name == "rcs") return 0;
+			if (name == "bcs") return 1;
+			if (name == "vcs") return 2;
+			if (name == "vecs") return 3;
+			if (name == "ccs") return 4;
+			return -1;
+		}
+
+		static bool parse_u64(std::string_view sv, uint64_t& out, std::string_view* rest = nullptr) {
+			while (not sv.empty() and (sv.front() == ' ' or sv.front() == '\t')) sv.remove_prefix(1);
+			if (sv.empty()) return false;
+			uint64_t val = 0;
+			auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
+			if (ec != std::errc{}) return false;
+			out = val;
+			if (rest) *rest = sv.substr(static_cast<size_t>(ptr - sv.data()));
+			return true;
+		}
+
+		static void sample_xe_fdinfo(xe_device& d, long long& out_util, uint64_t& out_fdinfo_vram) {
+			std::unordered_map<uint64_t, xe_client_sample> cur_clients;
+			DIR* proc_dir = opendir("/proc");
+			if (proc_dir != nullptr) {
+				char path_buf[256];
+				char link_buf[128];
+				char file_buf[4096];
+				struct dirent* pent = nullptr;
+				while ((pent = readdir(proc_dir)) != nullptr) {
+					if (pent->d_name[0] < '1' or pent->d_name[0] > '9') continue;
+					std::snprintf(path_buf, sizeof(path_buf), "/proc/%s/fd", pent->d_name);
+					DIR* fd_dir = opendir(path_buf);
+					if (fd_dir == nullptr) continue;
+					int fd_dir_fd = dirfd(fd_dir);
+					struct dirent* fent = nullptr;
+					while ((fent = readdir(fd_dir)) != nullptr) {
+						if (fent->d_name[0] == '.') continue;
+						ssize_t rlen = readlinkat(fd_dir_fd, fent->d_name, link_buf, sizeof(link_buf) - 1);
+						if (rlen < 9 or std::string_view(link_buf, static_cast<size_t>(rlen)).substr(0, 9) != "/dev/dri/") continue;
+
+						std::snprintf(path_buf, sizeof(path_buf), "/proc/%s/fdinfo/%s", pent->d_name, fent->d_name);
+						int fd = open(path_buf, O_RDONLY | O_CLOEXEC);
+						if (fd < 0) continue;
+						ssize_t nread = read(fd, file_buf, sizeof(file_buf) - 1);
+						close(fd);
+						if (nread <= 0) continue;
+
+						std::string_view content(file_buf, static_cast<size_t>(nread));
+						if (content.find("drm-driver:\txe") == std::string_view::npos and
+							content.find("drm-driver: xe") == std::string_view::npos) {
+							continue;
+						}
+
+						bool has_cid = false;
+						bool pdev_ok = d.pci_slot.empty();
+						uint64_t cid = 0;
+						xe_client_sample sample{};
+
+						size_t pos = 0;
+						while (pos < content.size()) {
+							size_t eol = content.find('\n', pos);
+							std::string_view line = (eol == std::string_view::npos)
+								? content.substr(pos)
+								: content.substr(pos, eol - pos);
+							pos = (eol == std::string_view::npos) ? content.size() : eol + 1;
+
+							size_t colon = line.find(':');
+							if (colon == std::string_view::npos) continue;
+							std::string_view key = line.substr(0, colon);
+							std::string_view val = line.substr(colon + 1);
+							while (not val.empty() and (val.front() == ' ' or val.front() == '\t')) val.remove_prefix(1);
+							while (not val.empty() and (val.back() == '\r' or val.back() == ' ' or val.back() == '\t')) val.remove_suffix(1);
+
+							if (key == "drm-pdev") {
+								pdev_ok = d.pci_slot.empty() or (val == d.pci_slot);
+								if (not pdev_ok) break;
+							} else if (key == "drm-client-id") {
+								if (parse_u64(val, cid)) {
+									has_cid = true;
+									if (cur_clients.contains(cid)) break;
+								}
+							} else if (key.starts_with("drm-cycles-")) {
+								int idx = engine_index(key.substr(11));
+								if (idx >= 0) parse_u64(val, sample.cycles[idx]);
+							} else if (key.starts_with("drm-total-cycles-")) {
+								int idx = engine_index(key.substr(17));
+								if (idx >= 0) parse_u64(val, sample.total_cycles[idx]);
+							} else if (key.starts_with("drm-engine-capacity-")) {
+								int idx = engine_index(key.substr(20));
+								if (idx >= 0) parse_u64(val, sample.capacity[idx]);
+							} else if (key == "drm-resident-vram0") {
+								uint64_t vram_val = 0;
+								std::string_view unit;
+								if (parse_u64(val, vram_val, &unit)) {
+									if (unit.find("KiB") != std::string_view::npos or unit.find("kB") != std::string_view::npos)
+										vram_val *= 1024ULL;
+									else if (unit.find("MiB") != std::string_view::npos or unit.find("MB") != std::string_view::npos)
+										vram_val *= 1024ULL * 1024ULL;
+									sample.vram_bytes = vram_val;
+								}
+							}
+						}
+
+						if (pdev_ok and has_cid and not cur_clients.contains(cid)) {
+							cur_clients.emplace(cid, sample);
+						}
+					}
+					closedir(fd_dir);
+				}
+				closedir(proc_dir);
+			}
+
+			uint64_t vram_sum = 0;
+			for (const auto& [cid, s] : cur_clients) {
+				(void)cid;
+				vram_sum += s.vram_bytes;
+			}
+			out_fdinfo_vram = vram_sum;
+
+			double max_util = 0.0;
+			if (not cur_clients.empty() and not d.prev_clients.empty()) {
+				for (size_t e = 0; e < 5; ++e) {
+					double eng_util = 0.0;
+					for (const auto& [cid, cur] : cur_clients) {
+						auto it = d.prev_clients.find(cid);
+						if (it == d.prev_clients.end()) continue;
+						const auto& prev = it->second;
+						if (cur.total_cycles[e] > prev.total_cycles[e] and cur.cycles[e] >= prev.cycles[e]) {
+							uint64_t dc = cur.cycles[e] - prev.cycles[e];
+							uint64_t dt = cur.total_cycles[e] - prev.total_cycles[e];
+							uint64_t cap = std::max<uint64_t>(cur.capacity[e], 1);
+							eng_util += static_cast<double>(dc) * 100.0 / (static_cast<double>(dt) * static_cast<double>(cap));
+						}
+					}
+					max_util = std::max(max_util, eng_util);
+				}
+			} else if (cur_clients.empty() and not d.gt_idle_path.empty()) {
+				long long now_us = get_monotonicTimeUSec();
+				long long cur_idle_ms = read_ll(d.gt_idle_path, -1);
+				if (cur_idle_ms >= 0 and d.prev_idle_ts_us > 0 and now_us > d.prev_idle_ts_us and cur_idle_ms >= d.prev_idle_ms) {
+					double dt_ms = static_cast<double>(now_us - d.prev_idle_ts_us) / 1000.0;
+					double didle_ms = static_cast<double>(cur_idle_ms - d.prev_idle_ms);
+					if (dt_ms > 0.0) {
+						max_util = std::clamp(100.0 - (didle_ms * 100.0 / dt_ms), 0.0, 100.0);
+					}
+				}
+				if (cur_idle_ms >= 0) {
+					d.prev_idle_ms = cur_idle_ms;
+					d.prev_idle_ts_us = now_us;
+				}
+			}
+
+			d.prev_clients = std::move(cur_clients);
+			out_util = std::clamp(static_cast<long long>(std::round(max_util)), 0LL, 100LL);
+		}
+
+		static bool init_xe() {
+			xe_devices.clear();
+			const fs::path drm_root("/sys/class/drm");
+			std::error_code ec;
+			if (not fs::is_directory(drm_root, ec)) return false;
+
+			for (const auto& entry : fs::directory_iterator(drm_root, ec)) {
+				const string card_name = entry.path().filename().string();
+				if (not is_card_node(card_name)) continue;
+
+				const auto device_link = entry.path() / "device";
+				if (not fs::exists(device_link, ec)) continue;
+
+				string vendor = trim_sysfs(readfile(device_link / "vendor", ""));
+				if (vendor != "0x8086") continue;
+
+				const auto driver_link = fs::read_symlink(device_link / "driver", ec);
+				if (ec or driver_link.filename().string() != "xe") continue;
+
+				xe_device d{};
+				d.device = device_link;
+				const auto dev_target = fs::read_symlink(device_link, ec);
+				if (not ec) d.pci_slot = dev_target.filename().string();
+
+				try {
+					d.pci_device_id = static_cast<uint32_t>(std::stoul(readfile(device_link / "device", "0"), nullptr, 0));
+				} catch (const std::exception&) {
+					d.pci_device_id = 0;
+				}
+				d.name = lookup_xe_device_name(d.pci_device_id);
+
+				//? Locate DRM render/card node for unprivileged ioctl queries
+				const auto drm_sub = device_link / "drm";
+				if (fs::is_directory(drm_sub, ec)) {
+					for (const auto& dent : fs::directory_iterator(drm_sub, ec)) {
+						string dn = dent.path().filename().string();
+						if (dn.starts_with("renderD")) {
+							d.drm_fd = open((fs::path("/dev/dri") / dn).c_str(), O_RDONLY | O_CLOEXEC);
+							if (d.drm_fd >= 0) break;
+						}
+					}
+				}
+				if (d.drm_fd < 0) {
+					d.drm_fd = open((fs::path("/dev/dri") / card_name).c_str(), O_RDONLY | O_CLOEXEC);
+				}
+
+				uint64_t vram_total = 0, vram_used = 0;
+				if (query_xe_vram(d.drm_fd, vram_total, vram_used) and vram_total > 0) {
+					d.has_vram = true;
+					d.vram_total = vram_total;
+				}
+
+				//? Clock frequency sysfs path
+				for (const auto& rel : {"tile0/gt0/freq0/act_freq", "tile0/gt0/freq0/cur_freq", "gt/gt0/freq0/act_freq", "gt/gt0/freq0/cur_freq"}) {
+					if (fs::exists(device_link / rel, ec)) {
+						d.freq_path = device_link / rel;
+						d.has_freq = true;
+						d.freq_is_hz = false;
+						break;
+					}
+				}
+
+				//? GT idle residency fallback path
+				for (const auto& rel : {"tile0/gt0/gtidle/idle_residency_ms", "gt/gt0/gtidle/idle_residency_ms"}) {
+					if (fs::exists(device_link / rel, ec)) {
+						d.gt_idle_path = device_link / rel;
+						d.prev_idle_ms = read_ll(d.gt_idle_path, 0);
+						d.prev_idle_ts_us = get_monotonicTimeUSec();
+						break;
+					}
+				}
+
+				//? Hwmon sensors (temperature, power/energy, frequency fallback)
+				d.hwmon = find_hwmon(device_link);
+				if (not d.hwmon.empty()) {
+					if (not d.has_freq and fs::exists(d.hwmon / "freq1_input", ec)) {
+						d.freq_path = d.hwmon / "freq1_input";
+						d.has_freq = true;
+						d.freq_is_hz = true;
+					}
+
+					//? Temperature: prefer "pkg" or "gpu" label, fallback to lowest-numbered temp*_input
+					int best_temp_prio = 999;
+					for (const auto& hent : fs::directory_iterator(d.hwmon, ec)) {
+						string fn = hent.path().filename().string();
+						if (not fn.starts_with("temp") or not fn.ends_with("_input")) continue;
+						string prefix = fn.substr(0, fn.size() - 6); // "tempN"
+						string label = trim_sysfs(readfile(d.hwmon / (prefix + "_label"), ""));
+						int prio = 50;
+						if (label == "pkg") prio = 1;
+						else if (label == "gpu" or label == "edge") prio = 2;
+						else if (label == "vram") prio = 3;
+						if (prio < best_temp_prio) {
+							best_temp_prio = prio;
+							d.temp_path = hent.path();
+							long long crit = read_ll(d.hwmon / (prefix + "_crit"), 0);
+							if (crit <= 0) crit = read_ll(d.hwmon / (prefix + "_max"), 0);
+							if (crit > 0) d.temp_max = crit / 1000;
+						}
+					}
+					d.has_temp = not d.temp_path.empty();
+
+					//? Power: check direct power1_average/power1_input first, then energy*_input counters
+					if (fs::exists(d.hwmon / "power1_average", ec)) {
+						d.power_path = d.hwmon / "power1_average";
+						d.has_power = true;
+					} else if (fs::exists(d.hwmon / "power1_input", ec)) {
+						d.power_path = d.hwmon / "power1_input";
+						d.has_power = true;
+					} else {
+						int best_energy_prio = 999;
+						for (const auto& hent : fs::directory_iterator(d.hwmon, ec)) {
+							string fn = hent.path().filename().string();
+							if (not fn.starts_with("energy") or not fn.ends_with("_input")) continue;
+							string prefix = fn.substr(0, fn.size() - 6); // "energyN"
+							string label = trim_sysfs(readfile(d.hwmon / (prefix + "_label"), ""));
+							int prio = 50;
+							if (label == "card" or label == "gpu") prio = 1;
+							else if (label == "pkg") prio = 2;
+							if (prio < best_energy_prio) {
+								best_energy_prio = prio;
+								d.energy_path = hent.path();
+							}
+						}
+						if (not d.energy_path.empty()) {
+							d.has_power = true;
+							d.prev_energy_uj = read_ll(d.energy_path, 0);
+							d.prev_energy_ts_us = get_monotonicTimeUSec();
+						}
+					}
+
+					long long cap_uw = read_ll(d.hwmon / "power1_cap", 0);
+					if (cap_uw <= 0) cap_uw = read_ll(d.hwmon / "power1_max", 0);
+					if (cap_uw <= 0) cap_uw = read_ll(d.hwmon / "power1_rated_max", 0);
+					if (cap_uw > 0) d.pwr_max = cap_uw / 1000;
+				}
+
+				long long dummy_util = 0;
+				uint64_t dummy_vram = 0;
+				sample_xe_fdinfo(d, dummy_util, dummy_vram);
+
+				xe_devices.push_back(std::move(d));
+			}
+
+			if (xe_devices.empty()) return false;
+
+			//? Brief delay so initial collect<1> computes non-zero power and utilization deltas
+			usleep(25'000);
+
+			use_xe = true;
+			device_count = static_cast<uint32_t>(xe_devices.size());
+			const size_t base_idx = gpus.size();
+			gpus.resize(base_idx + device_count);
+			gpu_names.resize(base_idx + device_count);
+			for (uint32_t i = 0; i < device_count; ++i) {
+				gpu_names[base_idx + i] = xe_devices[i].name;
+			}
+
+			initialized = true;
+			Logger::info("Using Intel Xe driver for {} Intel GPU(s)", device_count);
+			Intel::collect<1>(gpus.data() + base_idx);
+			return true;
+		}
+
 		bool init() {
 			if (initialized) return false;
+
+			if (init_xe()) return true;
 
 			char *gpu_path = find_intel_gpu_dir();
 			if (!gpu_path) {
@@ -1918,6 +2394,7 @@ namespace Gpu {
 			}
 
 			char *gpu_device_id = get_intel_device_id(gpu_path);
+			free(gpu_path);
 			if (!gpu_device_id) {
 				Logger::debug("Failed to find Intel GPU device ID, Intel GPUs will not be detected");
 				return false;
@@ -1951,7 +2428,7 @@ namespace Gpu {
 			device_count = 1;
 
 			gpus.resize(gpus.size() + device_count);
-			gpu_names.resize(gpus.size() + device_count);
+			gpu_names.resize(gpus.size());
 
 			if (gpu_device_name) {
 				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count] = string(gpu_device_name);
@@ -1969,6 +2446,19 @@ namespace Gpu {
 
 		bool shutdown() {
 			if (!initialized) return false;
+			if (use_xe) {
+				for (auto& d : xe_devices) {
+					if (d.drm_fd >= 0) {
+						close(d.drm_fd);
+						d.drm_fd = -1;
+					}
+				}
+				xe_devices.clear();
+				device_count = 0;
+				use_xe = false;
+				initialized = false;
+				return true;
+			}
 			if (engines) {
 				free_engines(engines);
 				engines = nullptr;
@@ -1979,6 +2469,89 @@ namespace Gpu {
 
 		template <bool is_init> bool collect(gpu_info* gpus_slice) {
 			if (!initialized) return false;
+
+			if (use_xe) {
+				for (uint32_t i = 0; i < device_count; ++i) {
+					gpu_info& gpu = gpus_slice[i];
+					xe_device& d = xe_devices[i];
+
+					if constexpr (is_init) {
+						gpu.supported_functions = {
+							.gpu_utilization = true,
+							.mem_utilization = false,
+							.gpu_clock = d.has_freq,
+							.mem_clock = false,
+							.pwr_usage = d.has_power,
+							.pwr_state = false,
+							.temp_info = d.has_temp,
+							.mem_total = d.has_vram,
+							.mem_used = d.has_vram,
+							.pcie_txrx = false,
+							.encoder_utilization = false,
+							.decoder_utilization = false
+						};
+						gpu.pwr_max_usage = d.pwr_max;
+						gpu.temp_max = d.temp_max;
+						if (d.has_power) {
+							gpu_pwr_total_max += gpu.pwr_max_usage;
+						}
+					}
+
+					long long util = 0;
+					uint64_t fdinfo_vram = 0;
+					sample_xe_fdinfo(d, util, fdinfo_vram);
+					gpu.gpu_percent.at("gpu-totals").push_back(util);
+
+					if (d.has_freq) {
+						long long raw_freq = read_ll(d.freq_path, 0);
+						gpu.gpu_clock_speed = static_cast<unsigned int>(d.freq_is_hz ? (raw_freq / 1'000'000) : raw_freq);
+					}
+
+					if (d.has_power) {
+						if (not d.power_path.empty()) {
+							gpu.pwr_usage = read_ll(d.power_path, 0) / 1000;
+						} else if (not d.energy_path.empty()) {
+							long long now_us = get_monotonicTimeUSec();
+							long long cur_uj = read_ll(d.energy_path, -1);
+							if (cur_uj >= 0 and d.prev_energy_ts_us > 0 and now_us > d.prev_energy_ts_us and cur_uj >= d.prev_energy_uj) {
+								long long duj = cur_uj - d.prev_energy_uj;
+								long long dt_us = now_us - d.prev_energy_ts_us;
+								gpu.pwr_usage = (duj * 1000LL) / dt_us;
+							}
+							if (cur_uj >= 0) {
+								d.prev_energy_uj = cur_uj;
+								d.prev_energy_ts_us = now_us;
+							}
+						}
+						if (gpu.pwr_usage > gpu.pwr_max_usage) {
+							gpu.pwr_max_usage = gpu.pwr_usage;
+						}
+						long long pwr_pct = (gpu.pwr_max_usage > 0)
+							? std::clamp(static_cast<long long>(std::round(static_cast<double>(gpu.pwr_usage) * 100.0 / static_cast<double>(gpu.pwr_max_usage))), 0LL, 100LL)
+							: 0LL;
+						gpu.gpu_percent.at("gpu-pwr-totals").push_back(pwr_pct);
+					}
+
+					if (d.has_temp and (Config::getB("check_temp") or is_init)) {
+						gpu.temp.push_back(read_ll(d.temp_path, 0) / 1000);
+					}
+
+					if (d.has_vram) {
+						uint64_t total = d.vram_total;
+						uint64_t used = 0;
+						if (not query_xe_vram(d.drm_fd, total, used) or used == 0) {
+							if (fdinfo_vram > 0) used = fdinfo_vram;
+						}
+						gpu.mem_total = static_cast<long long>(total);
+						gpu.mem_used = static_cast<long long>(std::min(used, total));
+						long long vram_pct = (gpu.mem_total > 0)
+							? std::clamp(static_cast<long long>(std::round(static_cast<double>(gpu.mem_used) * 100.0 / static_cast<double>(gpu.mem_total))), 0LL, 100LL)
+							: 0LL;
+						gpu.gpu_percent.at("gpu-vram-totals").push_back(vram_pct);
+					}
+				}
+				return true;
+			}
 
 			if constexpr(is_init) {
 				gpus_slice->supported_functions = {
